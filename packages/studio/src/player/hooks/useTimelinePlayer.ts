@@ -185,15 +185,21 @@ export function useTimelinePlayer() {
         const time = adapter.getTime();
         const dur = adapter.getDuration();
         liveTime.notify(time); // direct DOM updates, no React re-render
-        if (time >= dur && !adapter.isPlaying()) {
+        const { inPoint, outPoint } = usePlayerStore.getState();
+        const rawLoopEnd = outPoint !== null ? outPoint : dur;
+        const rawLoopStart = inPoint !== null ? inPoint : 0;
+        const loopEnd = rawLoopStart < rawLoopEnd ? rawLoopEnd : dur;
+        const loopStart = rawLoopStart < rawLoopEnd ? rawLoopStart : 0;
+        if (time >= loopEnd) {
           if (usePlayerStore.getState().loopEnabled && dur > 0) {
-            adapter.seek(0);
-            liveTime.notify(0);
+            adapter.seek(loopStart);
+            liveTime.notify(loopStart);
             adapter.play();
             setIsPlaying(true);
             rafRef.current = requestAnimationFrame(tick);
             return;
           }
+          if (adapter.isPlaying()) adapter.pause();
           setCurrentTime(time); // sync Zustand once at end
           setIsPlaying(false);
           cancelAnimationFrame(rafRef.current);
@@ -241,7 +247,7 @@ export function useTimelinePlayer() {
     const adapter = getAdapter();
     if (!adapter) return;
     if (adapter.getTime() >= adapter.getDuration()) {
-      adapter.seek(0);
+      adapter.seek(usePlayerStore.getState().inPoint ?? 0);
     }
     unmutePreviewMedia(iframeRef.current);
     applyPlaybackRate(usePlayerStore.getState().playbackRate);
@@ -269,15 +275,20 @@ export function useTimelinePlayer() {
       const tick = (now: number) => {
         const elapsed = ((now - startedAt) / 1000) * speed;
         let nextTime = startTime - elapsed;
-        if (nextTime <= 0) {
+        const { inPoint, outPoint } = usePlayerStore.getState();
+        const rawLoopEnd = outPoint !== null ? outPoint : duration;
+        const rawLoopStart = inPoint !== null ? inPoint : 0;
+        const loopEnd = rawLoopStart < rawLoopEnd ? rawLoopEnd : duration;
+        const loopStart = rawLoopStart < rawLoopEnd ? rawLoopStart : 0;
+        if (nextTime <= loopStart) {
           if (usePlayerStore.getState().loopEnabled && duration > 0) {
-            startTime = duration;
+            startTime = loopEnd;
             startedAt = now;
-            nextTime = duration;
+            nextTime = loopEnd;
           } else {
-            adapter.seek(0);
-            liveTime.notify(0);
-            setCurrentTime(0);
+            adapter.seek(loopStart);
+            liveTime.notify(loopStart);
+            setCurrentTime(loopStart);
             setIsPlaying(false);
             shuttleDirectionRef.current = null;
             reverseRafRef.current = 0;
