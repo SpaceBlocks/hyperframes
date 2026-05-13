@@ -24,7 +24,7 @@
  * never have to handle them.
  */
 
-import { existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { type CanvasResolution } from "@hyperframes/core";
 import { type EngineConfig, resolveConfig } from "@hyperframes/engine";
@@ -102,6 +102,16 @@ export interface DistributedRenderConfig {
   entryFile?: string;
   /** Caller-supplied AbortSignal. Threaded through compile / probe / extract / audio stages. */
   abortSignal?: AbortSignal;
+  /**
+   * Hard ceiling on `<planDir>/` size in bytes; trips a non-retryable
+   * `PLAN_TOO_LARGE` error after freeze. Defaults to
+   * {@link PLAN_DIR_SIZE_LIMIT_BYTES} (2 GB — fits inside AWS Lambda's
+   * 10 GB `/tmp` budget alongside the chunk worker's frame buffer +
+   * ffmpeg working set). Adapters that deploy onto storage with
+   * tighter ceilings can pass a smaller cap; tests pass a tiny cap to
+   * exercise the throw path.
+   */
+  planDirSizeLimitBytes?: number;
 }
 
 /**
@@ -125,6 +135,81 @@ export interface PlanResult {
 export const DEFAULT_CHUNK_SIZE = 240;
 /** Default cap on parallel chunks for operational fairness across renders. */
 export const DEFAULT_MAX_PARALLEL_CHUNKS = 16;
+/**
+ * Default hard ceiling on `<planDir>/` size in bytes. 2 GB fits inside
+ * AWS Lambda's 10 GB `/tmp` alongside the chunk worker's captured frames
+ * and ffmpeg's temporary files. Compositions that exceed this have to
+ * fall back to the in-process renderer until per-chunk video-frame
+ * slicing lands.
+ */
+export const PLAN_DIR_SIZE_LIMIT_BYTES = 2 * 1024 * 1024 * 1024;
+
+/**
+ * Non-retryable error code raised when `plan()` produces a planDir whose
+ * total size exceeds the configured limit. Workflow adapters key retry
+ * policies off `code` — the planDir would fail the same way on every
+ * retry, so the failure must not auto-retry.
+ */
+export const PLAN_TOO_LARGE = "PLAN_TOO_LARGE";
+
+/** Typed error raised when the produced planDir exceeds {@link PLAN_DIR_SIZE_LIMIT_BYTES}. */
+export class PlanTooLargeError extends Error {
+  readonly code: typeof PLAN_TOO_LARGE = PLAN_TOO_LARGE;
+  readonly sizeBytes: number;
+  readonly limitBytes: number;
+  constructor(sizeBytes: number, limitBytes: number) {
+    super(
+      `[plan] planDir size ${formatBytes(sizeBytes)} exceeds the configured ceiling ` +
+        `${formatBytes(limitBytes)} (PLAN_TOO_LARGE). The default 2 GB cap fits inside AWS ` +
+        `Lambda's 10 GB /tmp budget alongside the chunk worker's frame buffer and ffmpeg's ` +
+        `working set. To unblock: shorten the composition, lower the framerate, or use the ` +
+        `in-process renderer (\`executeRenderJob\`) — it has no planDir size cap.`,
+    );
+    this.name = "PlanTooLargeError";
+    this.sizeBytes = sizeBytes;
+    this.limitBytes = limitBytes;
+  }
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+}
+
+/**
+ * Walk `<planDir>/` depth-first and sum all regular file sizes. Symlinks
+ * are not traversed — they shouldn't appear inside a planDir to begin with
+ * (the extract stage materializes them), and following them could push the
+ * walker outside the planDir.
+ */
+export function measurePlanDirBytes(planDir: string): number {
+  let total = 0;
+  function walk(dir: string): void {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (entry.isFile()) {
+        try {
+          total += statSync(full).size;
+        } catch {
+          // Ignore — a file disappearing during the walk shouldn't crash
+          // the measurement.
+        }
+      }
+    }
+  }
+  walk(planDir);
+  return total;
+}
 
 /**
  * Compute `(chunkCount, effectiveChunkSize)` from total frames and the
@@ -521,8 +606,8 @@ export async function plan(
 
   // Clean up the temp work tree. `.plan-work/` holds intermediate
   // compileStage artifacts that are now promoted into `planDir/`; leaving
-  // it would inflate the planDir-size check and confuse chunk workers' file
-  // walks.
+  // it would inflate the planDir-size check below and confuse chunk
+  // workers' file walks.
   try {
     rmSync(workDir, { recursive: true, force: true });
   } catch (err) {
@@ -530,6 +615,16 @@ export async function plan(
       workDir,
       error: err instanceof Error ? err.message : String(err),
     });
+  }
+
+  // 2 GB hard cap so the planDir fits inside Lambda's 10 GB /tmp budget
+  // alongside the chunk worker's frame buffer + ffmpeg working set. The
+  // check runs AFTER cleanup so the workDir tree doesn't double-count.
+  // Non-retryable: the same planDir would trip the cap on every retry.
+  const sizeLimitBytes = config.planDirSizeLimitBytes ?? PLAN_DIR_SIZE_LIMIT_BYTES;
+  const planDirBytes = measurePlanDirBytes(planDir);
+  if (planDirBytes > sizeLimitBytes) {
+    throw new PlanTooLargeError(planDirBytes, sizeLimitBytes);
   }
 
   return {
